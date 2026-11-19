@@ -1,0 +1,154 @@
+name: Dev CI & Release PR
+
+on:
+  push:
+    branches: [develop]
+  workflow_dispatch:
+
+concurrency:
+  group: dev-pipeline-${{ github.ref }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  dev-checks:
+    name: Dev Lint e Testes Unitários
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Instalar dependências
+        run: pip install -e ".[dev]"
+
+      - name: Lint e formatação (ruff)
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Testes unitários (pytest)
+        run: pytest
+
+  release-pr:
+    name: Abrir ou Atualizar PR de Release
+    needs: dev-checks
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      pr_created: ${{ steps.upsert-pr.outputs.pr_created }}
+      pr_number: ${{ steps.upsert-pr.outputs.pr_number }}
+      version: ${{ steps.compute.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Calcular versão e lista de commits
+        id: compute
+        run: |
+          git fetch origin +refs/heads/main:refs/remotes/origin/main --tags
+          ahead=$(git rev-list --count origin/main..HEAD)
+          if [ "$ahead" -eq 0 ]; then
+            echo "Nenhum commit à frente da main. PR de release não necessário."
+            echo "has_changes=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version=$(python3 .github/scripts/versioning.py next)
+          title=$(python3 .github/scripts/versioning.py title)
+          git log origin/main..HEAD --pretty=format:'- `%h` %s (%an)' > /tmp/commits.md
+
+          {
+            echo "has_changes=true"
+            echo "version=$version"
+            echo "title=$title"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Criar ou atualizar PR Release -> main
+        id: upsert-pr
+        if: steps.compute.outputs.has_changes == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require("fs");
+            const version = "${{ steps.compute.outputs.version }}";
+            const title = "${{ steps.compute.outputs.title }}";
+            const commits = fs.readFileSync("/tmp/commits.md", "utf8").trim();
+
+            const body = [
+              `## ${title}`,
+              "",
+              "PR automático gerado pela esteira **Dev → Homol** a partir da branch `develop`.",
+              "",
+              "### Commits incluídos",
+              commits || "- Sem commits listados.",
+              "",
+              "### Gates exigidos em Homol",
+              "- [ ] Lint e formatação (`ruff check` / `ruff format --check`)",
+              "- [ ] Testes unitários + cobertura mínima (`pytest --cov-fail-under`)",
+              "- [ ] Empacotamento limpo (`pip install .`) + ML Quality Gate",
+              "- [ ] Build Docker + smoke test da API (`/health` e `/predict`)",
+              "",
+              "> **Ao promover para `main` (Prod):** utilize **Create a merge commit** para manter `develop` e `main` sincronizadas.",
+            ].join("\n");
+
+            const { data: openPrs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:develop`,
+              base: "main",
+              state: "open",
+            });
+
+            if (openPrs.length > 0) {
+              const existing = openPrs[0];
+              await github.rest.pulls.update({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                pull_number: existing.number,
+                title,
+                body,
+              });
+              core.info(`PR #${existing.number} atualizado: ${title}`);
+              core.setOutput("pr_created", "false");
+              core.setOutput("pr_number", String(existing.number));
+              return;
+            }
+
+            try {
+              const { data: created } = await github.rest.pulls.create({
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                title,
+                head: "develop",
+                base: "main",
+                body,
+              });
+              core.info(`PR #${created.number} criado: ${title}`);
+              core.setOutput("pr_created", "true");
+              core.setOutput("pr_number", String(created.number));
+            } catch (error) {
+              if (error.status === 403) {
+                core.error(
+                  "Permissão negada ao criar PR via GITHUB_TOKEN. " +
+                    "Habilite 'Allow GitHub Actions to create and approve pull requests' em " +
+                    "Settings -> Actions -> General -> Workflow permissions."
+                );
+              }
+              throw error;
+            }
+
+  homol-on-new-pr:
+    name: Homol Inicial (Novo PR)
+    needs: release-pr
+    if: needs.release-pr.outputs.pr_created == 'true'
+    uses: ./.github/workflows/_homol-checks.yml

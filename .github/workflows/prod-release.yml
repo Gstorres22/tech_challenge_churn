@@ -1,0 +1,65 @@
+name: Prod Validation & Release
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+concurrency:
+  group: prod-release
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  prod-checks:
+    name: Validação Final de Produção
+    uses: ./.github/workflows/_homol-checks.yml
+
+  publish-release:
+    name: Criar Tag e GitHub Release
+    needs: prod-checks
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Verificar tag e criar versão semver
+        id: check-and-tag
+        run: |
+          git fetch --tags
+          existing_tag=$(git tag --points-at HEAD | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -n 1 || true)
+          if [ -n "$existing_tag" ]; then
+            echo "HEAD já possui a tag $existing_tag. Nenhuma nova release será criada."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          version=$(python3 .github/scripts/versioning.py next)
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git tag -a "$version" -m "Release $version"
+          git push origin "$version"
+
+          {
+            echo "should_release=true"
+            echo "version=$version"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Publicar GitHub Release
+        if: steps.check-and-tag.outputs.should_release == 'true'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const version = "${{ steps.check-and-tag.outputs.version }}";
+            await github.rest.repos.createRelease({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              tag_name: version,
+              name: `Release ${version}`,
+              generate_release_notes: true,
+            });
