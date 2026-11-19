@@ -1,0 +1,16 @@
+name: Homol CI (Release PR)
+
+on:
+  pull_request:
+    branches: [main]
+    types: [opened, synchronize, reopened]
+  workflow_dispatch:
+
+concurrency:
+  group: homol-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  homol:
+    name: Validação de Homol
+    uses: ./.github/workflows/_homol-checks.yml

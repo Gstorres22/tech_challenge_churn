@@ -1,0 +1,173 @@
+name: Homol Checks
+
+on:
+  workflow_call:
+    inputs:
+      python_version:
+        description: Versão do Python para os checks
+        required: false
+        type: string
+        default: "3.12"
+      min_coverage:
+        description: Cobertura mínima exigida pelo pytest (%)
+        required: false
+        type: string
+        default: "70"
+      require_model:
+        description: Falha caso models/churn_model.joblib ainda não exista
+        required: false
+        type: boolean
+        default: false
+      min_roc_auc:
+        description: AUC-ROC mínimo no quality gate de ML
+        required: false
+        type: string
+        default: "0.75"
+      min_f1:
+        description: F1 mínimo no quality gate de ML
+        required: false
+        type: string
+        default: "0.50"
+
+jobs:
+  homol-lint-and-coverage:
+    name: Lint e Testes com Cobertura
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+
+      - name: Instalar dependências de desenvolvimento
+        run: pip install -e ".[dev]"
+
+      - name: Verificar lint e formatação (ruff)
+        run: |
+          ruff check .
+          ruff format --check .
+
+      - name: Executar testes e validar cobertura mínima
+        run: pytest --cov --cov-report=term-missing --cov-fail-under=${{ inputs.min_coverage }}
+
+  homol-package-and-ml-gate:
+    name: Pacote Limpo e Quality Gate de ML
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ inputs.python_version }}
+          cache: pip
+
+      - name: Instalar apenas dependências de produção
+        run: pip install .
+
+      - name: Smoke test de importação do pacote
+        run: |
+          python -c "import churn; from churn.api.main import app; print(f'Package OK: v{churn.__version__}, routes={len(app.routes)}')"
+
+      - name: Executar Quality Gate de ML
+        run: |
+          ARGS="--min-roc-auc ${{ inputs.min_roc_auc }} --min-f1 ${{ inputs.min_f1 }}"
+          if [ "${{ inputs.require_model }}" = "true" ]; then
+            ARGS="$ARGS --require-model"
+          fi
+          python .github/scripts/model_quality_gate.py $ARGS
+
+  homol-docker-smoke-test:
+    name: Docker Build e Smoke Test da API
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Build da imagem Docker
+        run: docker build -t churn-api:homol .
+
+      - name: Subir container e validar /health e /predict
+        run: |
+          docker run -d --name churn-api-smoke -p 8000:8000 churn-api:homol
+          python3 - <<'EOF'
+          import json
+          import time
+          import urllib.error
+          import urllib.request
+
+          base_url = "http://127.0.0.1:8000"
+          health_data = None
+          last_error = None
+
+          for _ in range(20):
+              try:
+                  with urllib.request.urlopen(f"{base_url}/health", timeout=2) as resp:
+                      assert resp.status == 200, f"Status inesperado em /health: {resp.status}"
+                      health_data = json.loads(resp.read().decode("utf-8"))
+                      break
+              except Exception as exc:
+                  last_error = exc
+                  time.sleep(1)
+
+          assert health_data is not None, f"API não respondeu em /health: {last_error}"
+          assert health_data.get("status") == "ok", f"Payload inesperado em /health: {health_data}"
+          print("Health OK:", health_data)
+
+          req_invalid = urllib.request.Request(
+              f"{base_url}/predict",
+              data=json.dumps({"tenure": -1}).encode("utf-8"),
+              headers={"Content-Type": "application/json"},
+              method="POST",
+          )
+          try:
+              urllib.request.urlopen(req_invalid, timeout=5)
+              raise AssertionError("Esperado HTTP 422 para payload inválido")
+          except urllib.error.HTTPError as err:
+              assert err.code == 422, f"Esperado 422, recebido {err.code}"
+              print("Validation 422 OK")
+
+          if health_data.get("model_loaded"):
+              sample = {
+                  "gender": "Female",
+                  "SeniorCitizen": 0,
+                  "Partner": "Yes",
+                  "Dependents": "No",
+                  "tenure": 12,
+                  "PhoneService": "Yes",
+                  "MultipleLines": "No",
+                  "InternetService": "Fiber optic",
+                  "OnlineSecurity": "No",
+                  "OnlineBackup": "Yes",
+                  "DeviceProtection": "No",
+                  "TechSupport": "No",
+                  "StreamingTV": "Yes",
+                  "StreamingMovies": "No",
+                  "Contract": "Month-to-month",
+                  "PaperlessBilling": "Yes",
+                  "PaymentMethod": "Electronic check",
+                  "MonthlyCharges": 79.85,
+                  "TotalCharges": 958.2,
+              }
+              req_valid = urllib.request.Request(
+                  f"{base_url}/predict",
+                  data=json.dumps(sample).encode("utf-8"),
+                  headers={"Content-Type": "application/json"},
+                  method="POST",
+              )
+              with urllib.request.urlopen(req_valid, timeout=5) as resp:
+                  assert resp.status == 200, f"Esperado 200 em /predict, recebido {resp.status}"
+                  pred = json.loads(resp.read().decode("utf-8"))
+                  prob = pred["churn_probability"]
+                  assert 0.0 <= prob <= 1.0, f"Probabilidade fora de [0, 1]: {prob}"
+                  print("Predict 200 OK:", pred)
+          EOF
+
+      - name: Logs e limpeza do container
+        if: always()
+        run: |
+          docker logs churn-api-smoke || true
+          docker rm -f churn-api-smoke || true
