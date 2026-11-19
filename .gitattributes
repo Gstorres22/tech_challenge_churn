@@ -1,0 +1,11 @@
+# Normaliza finais de linha (projeto editado no Windows, executado em Linux/Docker)
+* text=auto eol=lf
+*.bat text eol=crlf
+*.ps1 text eol=crlf
+
+# Binários
+*.joblib binary
+*.pkl binary
+*.png binary
+*.jpg binary
+*.pdf binary
