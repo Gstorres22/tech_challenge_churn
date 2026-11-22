@@ -3,6 +3,11 @@ name: Homol Checks
 on:
   workflow_call:
     inputs:
+      ref:
+        description: Branch ou SHA específico para checkout (vazio usa o ref padrão do evento)
+        required: false
+        type: string
+        default: ""
       python_version:
         description: Versão do Python para os checks
         required: false
@@ -41,6 +46,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -64,6 +71,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - uses: actions/setup-python@v5
         with:
@@ -91,6 +100,8 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ inputs.ref }}
 
       - name: Build da imagem Docker
         run: docker build -t churn-api:homol .
