@@ -1,4 +1,4 @@
-name: Dev CI & Release PR
+name: Dev CI & Release Branch
 
 on:
   push:
@@ -13,7 +13,7 @@ concurrency:
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
-  contents: read
+  contents: write
   pull-requests: write
 
 jobs:
@@ -44,7 +44,7 @@ jobs:
         run: python .github/scripts/model_quality_gate.py --require-model --min-roc-auc 0.80 --min-f1 0.55 --min-recall 0.60
 
   release-pr:
-    name: Abrir ou Atualizar PR de Release
+    name: Cortar Branch de Release e Abrir PR para main
     needs: dev-checks
     if: github.event_name != 'pull_request' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
@@ -52,48 +52,84 @@ jobs:
     outputs:
       pr_created: ${{ steps.upsert-pr.outputs.pr_created }}
       pr_number: ${{ steps.upsert-pr.outputs.pr_number }}
-      version: ${{ steps.compute.outputs.version }}
+      version: ${{ steps.plan.outputs.version }}
+      branch: ${{ steps.plan.outputs.branch }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Calcular versão e lista de commits
-        id: compute
+      - name: Planejar release e preparar branch release/vX.Y.Z
+        id: plan
         run: |
-          git fetch origin +refs/heads/main:refs/remotes/origin/main --tags
-          ahead=$(git rev-list --count origin/main..HEAD)
-          if [ "$ahead" -eq 0 ]; then
-            echo "Nenhum commit à frente da main. PR de release não necessário."
-            echo "has_changes=false" >> "$GITHUB_OUTPUT"
-            exit 0
+          git fetch origin \
+            +refs/heads/main:refs/remotes/origin/main \
+            '+refs/heads/release/*:refs/remotes/origin/release/*' \
+            --tags
+
+          plan_json=$(python3 .github/scripts/versioning.py plan-release)
+          echo "Release plan: $plan_json"
+
+          action=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["action"])' "$plan_json")
+          version=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["version"])' "$plan_json")
+          branch=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["branch"])' "$plan_json")
+          title=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["title"])' "$plan_json")
+          reason=$(python3 -c 'import json, sys; print(json.loads(sys.argv[1])["reason"])' "$plan_json")
+
+          echo "$reason"
+
+          if [ "$action" = "create_release" ]; then
+            git push origin "HEAD:refs/heads/$branch"
+            git log origin/main..HEAD --pretty=format:'- `%h` %s (%an)' > /tmp/commits.md
+          elif [ "$action" = "frozen_existing" ]; then
+            git log "origin/main..origin/$branch" --pretty=format:'- `%h` %s (%an)' > /tmp/commits.md
           fi
 
-          version=$(python3 .github/scripts/versioning.py next)
-          title=$(python3 .github/scripts/versioning.py title)
-          git log origin/main..HEAD --pretty=format:'- `%h` %s (%an)' > /tmp/commits.md
-
           {
-            echo "has_changes=true"
+            echo "action=$action"
             echo "version=$version"
+            echo "branch=$branch"
             echo "title=$title"
           } >> "$GITHUB_OUTPUT"
 
-      - name: Criar ou atualizar PR Release -> main
+      - name: Abrir ou preservar PR release/vX.Y.Z -> main
         id: upsert-pr
-        if: steps.compute.outputs.has_changes == 'true'
+        if: steps.plan.outputs.action == 'create_release' || steps.plan.outputs.action == 'frozen_existing'
         uses: actions/github-script@v7
         with:
           script: |
             const fs = require("fs");
-            const version = "${{ steps.compute.outputs.version }}";
-            const title = "${{ steps.compute.outputs.title }}";
-            const commits = fs.readFileSync("/tmp/commits.md", "utf8").trim();
+            const action = "${{ steps.plan.outputs.action }}";
+            const version = "${{ steps.plan.outputs.version }}";
+            const branch = "${{ steps.plan.outputs.branch }}";
+            const title = "${{ steps.plan.outputs.title }}";
+            const commits = fs.existsSync("/tmp/commits.md")
+              ? fs.readFileSync("/tmp/commits.md", "utf8").trim()
+              : "";
+
+            const { data: openPrs } = await github.rest.pulls.list({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              head: `${context.repo.owner}:${branch}`,
+              base: "main",
+              state: "open",
+            });
+
+            if (openPrs.length > 0) {
+              const existing = openPrs[0];
+              core.info(
+                `PR #${existing.number} (${branch} -> main) já está aberto e congelado em Homol. ` +
+                  `Novos commits em develop aguardam o merge desta release.`
+              );
+              core.setOutput("pr_created", "false");
+              core.setOutput("pr_number", String(existing.number));
+              return;
+            }
 
             const body = [
               `## ${title}`,
               "",
-              "PR automático gerado pela esteira **Dev → Homol** a partir da branch `develop`.",
+              `PR automático gerado pela esteira **Dev → Homol** a partir da branch congelada \`${branch}\`.`,
               "",
               "### Commits incluídos",
               commits || "- Sem commits listados.",
@@ -104,42 +140,22 @@ jobs:
               "- [ ] Empacotamento limpo (`pip install .`) + ML Quality Gate",
               "- [ ] Build Docker + smoke test da API (`/health` e `/predict`)",
               "",
-              "> **Ao promover para `main` (Prod):** utilize **Create a merge commit** para manter `develop` e `main` sincronizadas.",
+              "### Fluxo de Homologação e Produção",
+              `- Caso precise corrigir algo em Homol, faça commit diretamente na branch \`${branch}\` (os checks de Homol reexecutarão automaticamente).`,
+              "- Ao promover para `main` (Prod), utilize **Create a merge commit**.",
+              `- Após o merge na \`main\`, a esteira criará a tag \`${version}\` + GitHub Release, removerá \`${branch}\` e sincronizará eventuais ajustes de Homol de volta para \`develop\`.`,
             ].join("\n");
-
-            const { data: openPrs } = await github.rest.pulls.list({
-              owner: context.repo.owner,
-              repo: context.repo.repo,
-              head: `${context.repo.owner}:develop`,
-              base: "main",
-              state: "open",
-            });
-
-            if (openPrs.length > 0) {
-              const existing = openPrs[0];
-              await github.rest.pulls.update({
-                owner: context.repo.owner,
-                repo: context.repo.repo,
-                pull_number: existing.number,
-                title,
-                body,
-              });
-              core.info(`PR #${existing.number} atualizado: ${title}`);
-              core.setOutput("pr_created", "false");
-              core.setOutput("pr_number", String(existing.number));
-              return;
-            }
 
             try {
               const { data: created } = await github.rest.pulls.create({
                 owner: context.repo.owner,
                 repo: context.repo.repo,
                 title,
-                head: "develop",
+                head: branch,
                 base: "main",
                 body,
               });
-              core.info(`PR #${created.number} criado: ${title}`);
+              core.info(`PR #${created.number} criado (${action}): ${title} (${branch} -> main)`);
               core.setOutput("pr_created", "true");
               core.setOutput("pr_number", String(created.number));
             } catch (error) {
@@ -154,7 +170,9 @@ jobs:
             }
 
   homol-on-new-pr:
-    name: Homol Inicial (Novo PR)
+    name: Homol Inicial (Nova Branch de Release)
     needs: release-pr
     if: needs.release-pr.outputs.pr_created == 'true'
     uses: ./.github/workflows/_homol-checks.yml
+    with:
+      ref: ${{ needs.release-pr.outputs.branch }}

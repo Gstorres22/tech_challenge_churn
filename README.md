@@ -151,7 +151,7 @@ docker run -p 8000:8000 churn-api
 
 ## Esteira CI/CD (GitHub Actions — Dev, Homol e Prod)
 
-A esteira do projeto implementa um fluxo contínuo em três camadas (**Dev → Homol → Prod**) com controle de qualidade, cobertura mínima, empacotamento, containerização e versionamento automático por tags.
+A esteira do projeto implementa um fluxo contínuo em três camadas (**Dev → Homol congelada em `release/vX.Y.Z` → Prod**) com controle de qualidade, cobertura mínima, empacotamento, containerização, versionamento automático por tags e *back-merge* condicional para `develop`.
 
 ### Visão geral do fluxo
 
@@ -159,37 +159,45 @@ A esteira do projeto implementa um fluxo contínuo em três camadas (**Dev → H
 PR para develop ou push em develop (DEV)
   ├─► dev-checks: ruff check/format + pytest + ML Quality Gate
   │   (--require-model, roc_auc >= 0.80, f1 >= 0.55, recall >= 0.60, net_retained_revenue > 0)
-  └─► release-pr (somente em push na develop): se houver commits à frente da main,
-      abre ou atualiza o PR "Release vX.Y.Z" (develop -> main)
+  └─► release-pr (somente em push na develop): se houver commits à frente da main
+      e nenhuma branch release/v* aberta, cria release/vX.Y.Z + PR "Release vX.Y.Z" -> main
+      (se já existir uma release/v* aberta, Homol permanece congelada até o merge na main)
            │
            ▼
-PR "Release vX.Y.Z" -> main (HOMOL)
+Branch release/vX.Y.Z + PR "Release vX.Y.Z" -> main (HOMOL)
   ├─► homol-lint-and-coverage: ruff + pytest com cobertura mínima (>= 70%)
   ├─► homol-package-and-ml-gate: pip install . + smoke import + ML Quality Gate
   └─► homol-docker-smoke-test: docker build + teste de /health e /predict
+      (ajustes de bug em Homol podem ser commitados direto na release/vX.Y.Z)
            │
            ▼  (aprovação e merge manual com "Create a merge commit")
 push/merge em main (PROD)
   ├─► prod-checks: reexecuta todos os checks de Homol na main
-  └─► publish-release: cria tag anotada vX.Y.Z + GitHub Release automática
+  └─► publish-release:
+        1. cria tag anotada vX.Y.Z + GitHub Release automática
+        2. remove a branch release/vX.Y.Z já encerrada
+        3. verifica se Homol/Main teve ajustes ausentes na develop (via merge-base):
+           - se não houve ajustes exclusivos em Homol: não dispara nada
+           - se houve ajustes: sincroniza main -> develop (ou abre PR em caso de conflito)
 ```
 
-### Regra de versionamento sequencial
+### Regra de versionamento sequencial e congelamento de Homol
 
 - O versionamento é calculado por [.github/scripts/versioning.py](.github/scripts/versioning.py) de forma sequencial no componente `patch`: `v0.1.0` → `v0.1.1` → `v0.1.2` → ...
-- Enquanto o PR `Release vX.Y.Z` estiver aberto, novos pushes em `develop` **atualizam o mesmo PR** (com a lista atualizada de commits) sem abrir PRs duplicados.
-- Após o merge na `main` e publicação da tag `vX.Y.Z`, o próximo commit na `develop` abrirá automaticamente um novo PR para `vX.Y.(Z+1)`.
+- Existe **no máximo 1 branch `release/vX.Y.Z` ativa por vez**: enquanto `release/vX.Y.Z` estiver aberta em Homol, novos pushes na `develop` continuam passando em `dev-checks`, mas não contaminam a homologação em andamento.
+- Após o merge na `main` (tag `vX.Y.Z` publicada e branch `release/vX.Y.Z` removida), o próximo commit na `develop` abrirá automaticamente `release/vX.Y.(Z+1)`.
+- **Back-merge condicional:** se foram feitos ajustes diretamente na `release/vX.Y.Z` (ou `main`), a esteira de Prod compara `merge-base(origin/develop, HEAD)` contra `HEAD` e faz *back-merge* automático para `develop` (abrindo um PR `main -> develop` caso exista conflito). Se Homol subiu idêntica ao ponto de corte da `develop`, nenhum commit de sync é criado.
 - **Salto manual de versão:** para iniciar uma nova minor/major (ex.: `v0.2.0`), atualize `[project].version` no [pyproject.toml](pyproject.toml) para `"0.2.0"` — se for maior que a última tag existente, a esteira adotará `v0.2.0` e seguirá somando `+1` no patch a partir dela.
 
 ### O que cada arquivo da esteira faz
 
 | Arquivo | Camada | Gatilho (`on:`) | Responsabilidade |
 |---------|--------|-----------------|------------------|
-| [.github/workflows/dev-pipeline.yml](.github/workflows/dev-pipeline.yml) | **Dev** | `push` ou `pull_request` em `develop` (ou manual) | Roda `ruff` + `pytest` + ML Quality Gate; em `push` na `develop`, abre/atualiza o PR `Release vX.Y.Z` e dispara o Homol. |
-| [.github/workflows/homol-pr.yml](.github/workflows/homol-pr.yml) | **Homol** | `pull_request` para `main` (`opened`, `synchronize`, `reopened`) ou manual | Dispara o workflow reutilizável de Homol sempre que o PR recebe novos commits. |
-| [.github/workflows/_homol-checks.yml](.github/workflows/_homol-checks.yml) | **Homol / Prod** | `workflow_call` | Centraliza os 3 jobs pesados de homologação (cobertura, pacote/ML e Docker). |
-| [.github/workflows/prod-release.yml](.github/workflows/prod-release.yml) | **Prod** | `push` em `main` (ou manual) | Revalida toda a `main`, cria a tag `vX.Y.Z` e publica a GitHub Release com release notes. |
-| [.github/scripts/versioning.py](.github/scripts/versioning.py) | Script CI | Chamado pelos workflows | Lê tags Git e `[project].version` para determinar `vX.Y.Z` e `Release vX.Y.Z`. |
+| [.github/workflows/dev-pipeline.yml](.github/workflows/dev-pipeline.yml) | **Dev** | `push` ou `pull_request` em `develop` (ou manual) | Roda `ruff` + `pytest` + ML Quality Gate; em `push` na `develop`, cria `release/vX.Y.Z` (se nenhuma ativa), abre o PR para `main` e dispara o Homol inicial. |
+| [.github/workflows/homol-pr.yml](.github/workflows/homol-pr.yml) | **Homol** | `pull_request` para `main` (`opened`, `synchronize`, `reopened`) ou manual | Dispara o workflow reutilizável de Homol sempre que o PR `release/vX.Y.Z -> main` recebe novos commits. |
+| [.github/workflows/_homol-checks.yml](.github/workflows/_homol-checks.yml) | **Homol / Prod** | `workflow_call` | Centraliza os 3 jobs pesados de homologação (cobertura, pacote/ML e Docker), com checkout opcional por `ref`. |
+| [.github/workflows/prod-release.yml](.github/workflows/prod-release.yml) | **Prod** | `push` em `main` (ou manual) | Revalida toda a `main`, cria a tag `vX.Y.Z` + GitHub Release, remove `release/vX.Y.Z` e faz *back-merge* condicional para `develop`. |
+| [.github/scripts/versioning.py](.github/scripts/versioning.py) | Script CI | Chamado pelos workflows | Calcula `vX.Y.Z`, planeja o corte de `release/vX.Y.Z` (máx. 1 ativa) e decide se há ajustes de Homol/Main pendentes de *back-merge* para `develop`. |
 | [.github/scripts/model_quality_gate.py](.github/scripts/model_quality_gate.py) | Script CI | Chamado em Dev, Homol e Prod | Valida carga do `.joblib`, schema Pydantic, `predict_proba`, pisos (`roc_auc`, `f1`, `recall`) e `net_retained_revenue > 0`. |
 
 ### O que cada teste e quality gate valida
@@ -203,7 +211,7 @@ push/merge em main (PROD)
    - [tests/test_model_regression.py](tests/test_model_regression.py): regressão do artefato serializado (`< 5 MB`), reprodução do split de holdout no dataset real, pisos técnicos/financeiros, equivalência com [models/metrics.json](models/metrics.json), determinismo de inferência e sanidade direcional.
    - [tests/test_api.py](tests/test_api.py): endpoints `/health` (200), validação Pydantic em `/predict` (422), indisponibilidade do modelo (503) e inferência com probabilidade válida (200).
    - [tests/test_evaluate_and_pipeline.py](tests/test_evaluate_and_pipeline.py): métricas técnicas (`roc_auc`, `pr_auc`, `f1`, `precision`, `recall`, `accuracy`), limiar customizado, famílias de modelos exigidas com `SEED = 42` e construção do `Pipeline`.
-   - [tests/test_versioning.py](tests/test_versioning.py): regras de incremento sequencial, ordenação numérica (`v0.1.9` < `v0.1.10`), filtro de tags inválidas e leitura do `pyproject.toml`.
+   - [tests/test_versioning.py](tests/test_versioning.py): regras de incremento sequencial, ordenação numérica (`v0.1.9` < `v0.1.10`), filtro de tags inválidas, congelamento de branch `release/vX.Y.Z` (máx. 1 ativa), detecção de *back-merge* via `merge-base` e CLI.
    - [tests/test_model_quality_gate.py](tests/test_model_quality_gate.py): comportamento de *skip* opcional, bloqueio quando obrigatório e validação dos pisos de `roc_auc`, `f1`, `recall`, `net_retained_revenue > 0` e flag `--min-recall`.
 3. **Gate de cobertura (`--cov-fail-under=70`):** exige no mínimo 70% de cobertura sobre o pacote `src/churn/` em Homol e Prod.
 4. **Empacotamento limpo (`pip install .`):** instala apenas dependências de produção (sem `[dev]`) e verifica a importação do módulo e rotas da API FastAPI.
@@ -222,8 +230,8 @@ push/merge em main (PROD)
 
 ### Configuração única necessária no GitHub
 
-Para que a esteira consiga abrir automaticamente o PR de `develop` para `main` e criar tags/releases:
+Para que a esteira consiga criar a branch `release/vX.Y.Z`, abrir o PR para `main`, publicar tags/releases e sincronizar ajustes de Homol de volta para `develop`:
 
 1. No repositório no GitHub, acesse **Settings → Actions → General**.
-2. Em **Workflow permissions**, habilite **Allow GitHub Actions to create and approve pull requests** e clique em **Save**.
-3. Ao aprovar e subir um PR `Release vX.Y.Z` para a `main`, utilize **Create a merge commit** (evite *Squash and merge* para que `develop` e `main` mantenham histórico alinhado entre releases).
+2. Em **Workflow permissions**, habilite **Read and write permissions** e **Allow GitHub Actions to create and approve pull requests**, depois clique em **Save**.
+3. Ao aprovar e subir um PR `Release vX.Y.Z` (`release/vX.Y.Z` → `main`), utilize **Create a merge commit** (evite *Squash and merge* para preservar o `merge-base` exato entre `develop` e `main`).
