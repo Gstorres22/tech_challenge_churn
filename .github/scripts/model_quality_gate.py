@@ -51,8 +51,9 @@ def evaluate_model_gate(
     *,
     require_model: bool = False,
     metrics_path: Path | str | None = None,
-    min_roc_auc: float = 0.75,
-    min_f1: float = 0.50,
+    min_roc_auc: float = 0.80,
+    min_f1: float = 0.55,
+    min_recall: float = 0.60,
 ) -> GateResult:
     """Valida carga, contrato de entrada, saída probabilística e métricas do modelo."""
     path = Path(model_path)
@@ -99,6 +100,12 @@ def evaluate_model_gate(
                 )
             if "f1" in metrics and float(metrics["f1"]) < min_f1:
                 failures.append(f"f1={float(metrics['f1']):.4f} < mínimo {min_f1:.4f}")
+            if "recall" in metrics and float(metrics["recall"]) < min_recall:
+                failures.append(f"recall={float(metrics['recall']):.4f} < mínimo {min_recall:.4f}")
+            if "net_retained_revenue" in metrics and float(metrics["net_retained_revenue"]) <= 0.0:
+                failures.append(
+                    f"net_retained_revenue={float(metrics['net_retained_revenue']):.2f} <= 0.00"
+                )
             if failures:
                 return GateResult(
                     passed=False,
@@ -133,14 +140,20 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--min-roc-auc",
         type=float,
-        default=0.75,
+        default=0.80,
         help="Valor mínimo aceito para roc_auc.",
     )
     parser.add_argument(
         "--min-f1",
         type=float,
-        default=0.50,
+        default=0.55,
         help="Valor mínimo aceito para f1.",
+    )
+    parser.add_argument(
+        "--min-recall",
+        type=float,
+        default=0.60,
+        help="Valor mínimo aceito para recall.",
     )
     parser.add_argument(
         "--require-model",
@@ -155,6 +168,7 @@ def main(argv: list[str] | None = None) -> int:
         metrics_path=args.metrics_path,
         min_roc_auc=args.min_roc_auc,
         min_f1=args.min_f1,
+        min_recall=args.min_recall,
     )
     print(result.message)
     return 0 if result.passed else 1

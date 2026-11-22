@@ -3,11 +3,14 @@ name: Dev CI & Release PR
 on:
   push:
     branches: [develop]
+  pull_request:
+    branches: [develop]
+    types: [opened, synchronize, reopened]
   workflow_dispatch:
 
 concurrency:
-  group: dev-pipeline-${{ github.ref }}
-  cancel-in-progress: false
+  group: dev-pipeline-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
@@ -37,10 +40,13 @@ jobs:
       - name: Testes unitários (pytest)
         run: pytest
 
+      - name: Quality Gate de ML
+        run: python .github/scripts/model_quality_gate.py --require-model --min-roc-auc 0.80 --min-f1 0.55 --min-recall 0.60
+
   release-pr:
     name: Abrir ou Atualizar PR de Release
     needs: dev-checks
-    if: github.ref == 'refs/heads/develop'
+    if: github.event_name != 'pull_request' && github.ref == 'refs/heads/develop'
     runs-on: ubuntu-latest
     timeout-minutes: 10
     outputs:
