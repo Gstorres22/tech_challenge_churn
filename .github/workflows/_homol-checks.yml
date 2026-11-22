@@ -17,17 +17,22 @@ on:
         description: Falha caso models/churn_model.joblib ainda não exista
         required: false
         type: boolean
-        default: false
+        default: true
       min_roc_auc:
         description: AUC-ROC mínimo no quality gate de ML
         required: false
         type: string
-        default: "0.75"
+        default: "0.80"
       min_f1:
         description: F1 mínimo no quality gate de ML
         required: false
         type: string
-        default: "0.50"
+        default: "0.55"
+      min_recall:
+        description: Recall mínimo no quality gate de ML
+        required: false
+        type: string
+        default: "0.60"
 
 jobs:
   homol-lint-and-coverage:
@@ -74,7 +79,7 @@ jobs:
 
       - name: Executar Quality Gate de ML
         run: |
-          ARGS="--min-roc-auc ${{ inputs.min_roc_auc }} --min-f1 ${{ inputs.min_f1 }}"
+          ARGS="--min-roc-auc ${{ inputs.min_roc_auc }} --min-f1 ${{ inputs.min_f1 }} --min-recall ${{ inputs.min_recall }}"
           if [ "${{ inputs.require_model }}" = "true" ]; then
             ARGS="$ARGS --require-model"
           fi

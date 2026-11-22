@@ -1,18 +1,18 @@
 # ML Canvas — Previsão de Churn (Telco)
 
-> Etapa 1. Preencher durante o entendimento do problema.
+> Etapa 1 (atualizado com achados da EDA, formulação de métricas e resultados das Etapas 1 e 2).
 
 | Bloco | Descrição |
 |-------|-----------|
-| **Proposta de valor** | Identificar clientes com alto risco de cancelamento para ações de retenção antes do churn. |
-| **Stakeholders** | Diretoria, time de retenção/CRM, marketing, time de dados. |
-| **Decisões** | Quais clientes recebem ação de retenção (oferta, contato, desconto). |
-| **Tarefa de ML** | Classificação binária supervisionada (`Churn` = 1/0), saída em probabilidade. |
-| **Fontes de dados** | Telco Customer Churn (IBM): perfil, serviços contratados, contrato e cobrança. |
-| **Features** | _a definir após EDA_ |
-| **Métrica técnica** | _a definir_ (candidatas: AUC-ROC, F1, Recall da classe churn) |
-| **Métrica de negócio** | _a definir_ (ex.: receita retida líquida = churn evitado × LTV − custo da ação) |
-| **Predições** | Online via API `/predict`, por cliente. |
-| **Avaliação offline** | Validação cruzada estratificada + holdout. |
-| **Monitoramento** | _a definir_ (drift de features, taxa de churn real vs. prevista). |
-| **Riscos** | Desbalanceamento de classes, vieses por gênero/idade, mudança de comportamento ao longo do tempo. |
+| **Proposta de valor** | Identificar proativamente clientes com alto risco de cancelamento (*churn*) para direcionar campanhas de retenção (descontos, migração de plano, suporte técnico) com retorno financeiro líquido positivo. |
+| **Stakeholders** | Diretoria executiva, time de retenção/CRM, marketing, atendimento/suporte e engenharia de dados/ML. |
+| **Decisões** | Decidir quais clientes recebem ação de retenção (custo unitário de US$ 30,00) com base na probabilidade prevista `P(Churn=1) ≥ τ`, utilizando limiar calibrado para lucro máximo (`τ = 0,23` no campeão `random_forest`). |
+| **Tarefa de ML** | Classificação binária supervisionada (`Churn` = 1/0), saída em probabilidade contínua no intervalo $[0, 1]$. |
+| **Fontes de dados** | Dataset público [Telco Customer Churn (IBM)](https://www.kaggle.com/datasets/blastchar/telco-customer-churn) (`data/raw/WA_Fn-UseC_-Telco-Customer-Churn.csv`, **7.043 linhas × 21 colunas**, taxa global de churn **26,54%** — 1.869 *churners* e 5.174 *não churners*). |
+| **Features** | **19 features** (`customerID` removido por não ser informativo): **3 numéricas** (`tenure`, `MonthlyCharges`, `TotalCharges` — 11 espaços em branco em `tenure=0` tratados com `SimpleImputer(strategy="median")` + `StandardScaler`) e **16 categóricas** (`gender`, `SeniorCitizen` padronizado para `"Yes"/"No"`, `Partner`, `Dependents`, `PhoneService`, `MultipleLines`, `InternetService`, `OnlineSecurity`, `OnlineBackup`, `DeviceProtection`, `TechSupport`, `StreamingTV`, `StreamingMovies`, `Contract`, `PaperlessBilling`, `PaymentMethod` — `SimpleImputer(most_frequent)` + `OneHotEncoder(handle_unknown="ignore")`). Principais direcionadores observados na EDA: `Contract` (Month-to-month 42,71% vs Two year 2,83%), `tenure` (mediana 10 vs 38 meses), `InternetService` (Fiber optic 41,89% vs DSL 18,96%), `PaymentMethod` (Electronic check 45,29%), `OnlineSecurity` (No 41,77%) e `TechSupport` (No 41,64%). |
+| **Métrica técnica** | **Critério de seleção do modelo (CV):** `ROC-AUC` em 5-fold `StratifiedKFold` no treino (**campeão `random_forest`: `0,8465 ± 0,0090`**; holdout: **`0,8430`**). **Métricas complementares e Quality Gate (holdout):** `PR-AUC` (`0,6559`), `F1` (`0,6142`, piso ≥ `0,55`), `Recall` (`0,8342`, piso ≥ `0,60`), `Precision` (`0,4860`), `Accuracy` (`0,7218`) e `overfitting_gap` (`0,0737`, teto ≤ `0,12`). Não adotamos meta de 87% de precisão/acurácia pelo teto informacional tabular e pela assimetria econômica (~4,5:1) entre perder um *churner* (~US$ 134,00 de valor esperado) e abordar um falso positivo (US$ 30,00). |
+| **Métrica de negócio** | **Receita Retida Líquida** (`Receita Bruta Salva − Custo da Campanha`), com premissas em `src/churn/config.py`: `LTV = 6 meses`, `taxa de sucesso da retenção = 30%`, `custo da ação = US$ 30,00`. No holdout (`n=1.409`), o campeão em `τ = 0,23` gera **US$ 22.371,93** de receita retida líquida (**ROI = 1,16x**), **+US$ 15.655,11** acima da estratégia *Target-All* (US$ 6.716,82) e **+US$ 4.270,71** acima do limiar padrão `0,50` (US$ 18.101,22). |
+| **Predições** | Online via API FastAPI (`POST /predict` e `GET /health`), recebendo payload validado por Pydantic (`CustomerFeatures`) e retornando `churn_probability`, `churn` e `threshold`. Pipeline completo (`ColumnTransformer + RandomForestClassifier`) serializado em `models/churn_model.joblib`. |
+| **Avaliação offline** | Split estratificado determinístico **80/20** (`SEED = 42`: `5.634` treino / `1.409` holdout), `StratifiedKFold(5)` exclusivamente em `X_train`, calibração do threshold ótimo exclusivamente nas probabilidades *out-of-fold* (OOF) de treino e avaliação final única em `X_test`. |
+| **Monitoramento** | Drift de distribuição das features de entrada (`tenure`, `MonthlyCharges`, mix de `Contract` e `InternetService`), taxa de churn prevista vs. taxa real realizada, retorno financeiro efetivo das campanhas de retenção, latência/erros HTTP na API e reexecução do Quality Gate (`model_quality_gate.py`) a cada release. |
+| **Riscos** | Desbalanceamento de classes (26,54% positivos); disparidade etária observada na EDA (`SeniorCitizen=Yes` com 41,68% de churn vs 23,61% em não idosos, exigindo auditoria de equidade; `gender` mostrou equilíbrio: 26,92% vs 26,16%); *concept drift* por mudanças de planos/preços da operadora; calibração probabilística do `RandomForest` (gap treino-validação de `0,0737`, monitorado em `experiments.md`). |

@@ -52,3 +52,17 @@ FEATURES: list[str] = NUMERIC_FEATURES + CATEGORICAL_FEATURES
 # ------------------------------------------------------------------ treino
 TEST_SIZE: float = 0.2
 CV_FOLDS: int = 5
+
+# ------------------------------------------------------------------ caminhos de artefatos
+METRICS_PATH: Path = MODELS_DIR / "metrics.json"
+COMPARISON_REPORT_PATH: Path = REPORTS_DIR / "model_comparison.csv"
+FIGURES_DIR: Path = REPORTS_DIR / "figures"
+
+# ------------------------------------------------------------------ negócio e quality gate
+BUSINESS_LTV_MONTHS: int = 6
+BUSINESS_RETENTION_SUCCESS_RATE: float = 0.30
+BUSINESS_ACTION_COST: float = 30.0
+
+MIN_ROC_AUC: float = 0.80
+MIN_F1: float = 0.55
+MIN_RECALL: float = 0.60

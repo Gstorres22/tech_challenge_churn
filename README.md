@@ -37,20 +37,33 @@ tech_challenge_churn/
 │   ├── experiments.md         # Etapa 2: registro de experimentos
 │   ├── model_card.md          # Etapa 4: Model Card
 │   └── architecture.md        # Arquitetura e deploy na AWS
-├── models/                    # Modelo campeão serializado (.joblib)
+├── models/                    # Modelo campeão (.joblib) e métricas (metrics.json)
 ├── notebooks/                 # Experimentação (EDA, baseline, comparação)
-├── reports/figures/           # Gráficos gerados
+├── reports/
+│   ├── model_comparison.csv   # Comparativo CV dos modelos candidatos
+│   └── figures/               # Gráficos gerados
 ├── src/churn/                 # Código produtivo
-│   ├── config.py              # Caminhos, SEED e lista de features
+│   ├── config.py              # Caminhos, SEED, pisos e parâmetros de negócio
+│   ├── download.py            # Download automatizado do dataset (Kaggle)
 │   ├── data.py                # Carga e limpeza
 │   ├── features.py            # Pipeline de pré-processamento
-│   ├── train.py               # Treino e comparação de modelos
-│   ├── evaluate.py            # Métricas
+│   ├── train.py               # Treino, CV, seleção de threshold e comparação
+│   ├── evaluate.py            # Métricas técnicas (ROC/PR-AUC) e de negócio
 │   ├── predict.py             # Carga do modelo e inferência
 │   └── api/
 │       ├── main.py            # FastAPI (/health, /predict)
 │       └── schemas.py         # Contratos Pydantic
-├── tests/                     # Testes pytest
+├── tests/                     # Testes pytest (TDD)
+│   ├── conftest.py
+│   ├── test_api.py
+│   ├── test_business_metrics.py
+│   ├── test_download.py
+│   ├── test_evaluate_and_pipeline.py
+│   ├── test_ml_training.py
+│   ├── test_model_quality_gate.py
+│   ├── test_model_regression.py
+│   ├── test_preprocessing.py
+│   └── test_versioning.py
 ├── Dockerfile                 # Imagem da API
 ├── pyproject.toml             # Dependências e configuração de ferramentas
 └── README.md
@@ -143,9 +156,10 @@ A esteira do projeto implementa um fluxo contínuo em três camadas (**Dev → H
 ### Visão geral do fluxo
 
 ```text
-push em develop (DEV)
-  ├─► dev-checks: ruff check/format + pytest
-  └─► release-pr: se houver commits à frente da main,
+PR para develop ou push em develop (DEV)
+  ├─► dev-checks: ruff check/format + pytest + ML Quality Gate
+  │   (--require-model, roc_auc >= 0.80, f1 >= 0.55, recall >= 0.60, net_retained_revenue > 0)
+  └─► release-pr (somente em push na develop): se houver commits à frente da main,
       abre ou atualiza o PR "Release vX.Y.Z" (develop -> main)
            │
            ▼
@@ -171,25 +185,29 @@ push/merge em main (PROD)
 
 | Arquivo | Camada | Gatilho (`on:`) | Responsabilidade |
 |---------|--------|-----------------|------------------|
-| [.github/workflows/dev-pipeline.yml](.github/workflows/dev-pipeline.yml) | **Dev** | `push` em `develop` (ou manual) | Roda `ruff` + `pytest`, abre/atualiza o PR `Release vX.Y.Z` e dispara o Homol na criação do PR. |
+| [.github/workflows/dev-pipeline.yml](.github/workflows/dev-pipeline.yml) | **Dev** | `push` ou `pull_request` em `develop` (ou manual) | Roda `ruff` + `pytest` + ML Quality Gate; em `push` na `develop`, abre/atualiza o PR `Release vX.Y.Z` e dispara o Homol. |
 | [.github/workflows/homol-pr.yml](.github/workflows/homol-pr.yml) | **Homol** | `pull_request` para `main` (`opened`, `synchronize`, `reopened`) ou manual | Dispara o workflow reutilizável de Homol sempre que o PR recebe novos commits. |
 | [.github/workflows/_homol-checks.yml](.github/workflows/_homol-checks.yml) | **Homol / Prod** | `workflow_call` | Centraliza os 3 jobs pesados de homologação (cobertura, pacote/ML e Docker). |
 | [.github/workflows/prod-release.yml](.github/workflows/prod-release.yml) | **Prod** | `push` em `main` (ou manual) | Revalida toda a `main`, cria a tag `vX.Y.Z` e publica a GitHub Release com release notes. |
 | [.github/scripts/versioning.py](.github/scripts/versioning.py) | Script CI | Chamado pelos workflows | Lê tags Git e `[project].version` para determinar `vX.Y.Z` e `Release vX.Y.Z`. |
-| [.github/scripts/model_quality_gate.py](.github/scripts/model_quality_gate.py) | Script CI | Chamado em Homol/Prod | Valida carga do `.joblib`, schema Pydantic de entrada, `predict_proba` e métricas mínimas. |
+| [.github/scripts/model_quality_gate.py](.github/scripts/model_quality_gate.py) | Script CI | Chamado em Dev, Homol e Prod | Valida carga do `.joblib`, schema Pydantic, `predict_proba`, pisos (`roc_auc`, `f1`, `recall`) e `net_retained_revenue > 0`. |
 
 ### O que cada teste e quality gate valida
 
 1. **Qualidade de código (`ruff check` / `ruff format --check`):** garante estilo uniforme, ausência de imports/variáveis não usadas e conformidade com as regras do [pyproject.toml](pyproject.toml).
-2. **Testes unitários e de contrato (`pytest` em `tests/`):**
+2. **Testes unitários, TDD de ML e regressão (`pytest` em `tests/`):**
    - [tests/test_preprocessing.py](tests/test_preprocessing.py): carga do CSV, limpeza determinística, imputação e ausência de `NaN`s.
+   - [tests/test_download.py](tests/test_download.py): leitura segura de `KAGGLE_API_TOKEN`, download ZIP mockado via HTTP, cache (`force=False`/`True`) e erros de ZIP inválido.
+   - [tests/test_business_metrics.py](tests/test_business_metrics.py): receita retida líquida, ROI, baseline *target-all*, validações de erro (`ValueError`) e seleção de threshold ótimo acima do padrão `0.50`.
+   - [tests/test_ml_training.py](tests/test_ml_training.py): divisão estratificada determinística (`SEED = 42`), teste explícito anti-*data leakage* no pré-processamento, categorias inéditas, validação cruzada das 3 famílias (`logistic_regression`, `random_forest`, `mlp`) e treino ponta a ponta.
+   - [tests/test_model_regression.py](tests/test_model_regression.py): regressão do artefato serializado (`< 5 MB`), reprodução do split de holdout no dataset real, pisos técnicos/financeiros, equivalência com [models/metrics.json](models/metrics.json), determinismo de inferência e sanidade direcional.
    - [tests/test_api.py](tests/test_api.py): endpoints `/health` (200), validação Pydantic em `/predict` (422), indisponibilidade do modelo (503) e inferência com probabilidade válida (200).
-   - [tests/test_evaluate_and_pipeline.py](tests/test_evaluate_and_pipeline.py): métricas técnicas (`roc_auc`, `f1`, `precision`, `recall`, `accuracy`), limiar customizado, famílias de modelos exigidas com `SEED = 42` e construção do `Pipeline`.
+   - [tests/test_evaluate_and_pipeline.py](tests/test_evaluate_and_pipeline.py): métricas técnicas (`roc_auc`, `pr_auc`, `f1`, `precision`, `recall`, `accuracy`), limiar customizado, famílias de modelos exigidas com `SEED = 42` e construção do `Pipeline`.
    - [tests/test_versioning.py](tests/test_versioning.py): regras de incremento sequencial, ordenação numérica (`v0.1.9` < `v0.1.10`), filtro de tags inválidas e leitura do `pyproject.toml`.
-   - [tests/test_model_quality_gate.py](tests/test_model_quality_gate.py): comportamento de *skip* antes da Etapa 2, bloqueio quando obrigatório e validação de artefato `.joblib` + `metrics.json`.
+   - [tests/test_model_quality_gate.py](tests/test_model_quality_gate.py): comportamento de *skip* opcional, bloqueio quando obrigatório e validação dos pisos de `roc_auc`, `f1`, `recall`, `net_retained_revenue > 0` e flag `--min-recall`.
 3. **Gate de cobertura (`--cov-fail-under=70`):** exige no mínimo 70% de cobertura sobre o pacote `src/churn/` em Homol e Prod.
 4. **Empacotamento limpo (`pip install .`):** instala apenas dependências de produção (sem `[dev]`) e verifica a importação do módulo e rotas da API FastAPI.
-5. **Quality Gate de ML (`model_quality_gate.py`):** enquanto `models/churn_model.joblib` não existir (Etapa 1), registra `SKIP` sem bloquear a esteira; após o treino (Etapa 2+), valida inferência e métricas mínimas (`roc_auc >= 0.75`, `f1 >= 0.50`).
+5. **Quality Gate de ML (`model_quality_gate.py`):** ativo com `require_model = true` em Dev (`dev-checks`), Homol e Prod; valida inferência e exige `roc_auc >= 0.80`, `f1 >= 0.55`, `recall >= 0.60` e `net_retained_revenue > 0.0`.
 6. **Build Docker e Smoke Test (`homol-docker-smoke-test`):** constrói a imagem pelo [Dockerfile](Dockerfile), sobe o container, valida `/health` (HTTP 200) e `/predict` com payload inválido (HTTP 422) — e, quando houver modelo carregado, valida uma predição completa (HTTP 200).
 
 ### Onde ajustar testes, limiares e regras
@@ -197,7 +215,7 @@ push/merge em main (PROD)
 | O que deseja ajustar | Arquivo | Onde editar |
 |----------------------|---------|-------------|
 | Adicionar ou alterar testes automatizados | `tests/test_*.py` | Crie funções `test_*` seguindo as fixtures de [tests/conftest.py](tests/conftest.py). |
-| Alterar cobertura mínima, limiares de ML ou exigir modelo | [.github/workflows/_homol-checks.yml](.github/workflows/_homol-checks.yml) | Bloco `on.workflow_call.inputs` (`min_coverage`, `require_model`, `min_roc_auc`, `min_f1`). Após concluir a Etapa 2, mude `require_model` para `true`. |
+| Alterar cobertura mínima, limiares de ML ou exigir modelo | [.github/workflows/_homol-checks.yml](.github/workflows/_homol-checks.yml) e [.github/workflows/dev-pipeline.yml](.github/workflows/dev-pipeline.yml) | Inputs (`min_coverage`, `require_model`, `min_roc_auc`, `min_f1`, `min_recall`) e argumentos passados a `model_quality_gate.py`. |
 | Mudar regras do `ruff`, `pytest` ou cobertura | [pyproject.toml](pyproject.toml) | Seções `[tool.pytest.ini_options]`, `[tool.ruff]` e `[tool.coverage.run]`. |
 | Mudar versão inicial ou forçar salto de versão | [pyproject.toml](pyproject.toml) | Campo `version` em `[project]`. |
 | Alterar fluxo de triggers ou nomes de branches | `.github/workflows/*.yml` | Seção `on:` dos workflows (`develop` / `main`). |

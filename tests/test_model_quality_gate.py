@@ -98,3 +98,126 @@ def test_gate_passes_when_metrics_meet_threshold(tmp_path, sample_raw_df):
 
     assert result.passed is True
     assert result.skipped is False
+
+
+def test_gate_fails_when_recall_below_threshold(tmp_path, sample_raw_df):
+    gate = _load_gate_module()
+    model_path = _save_dummy_pipeline(tmp_path, sample_raw_df)
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "roc_auc": 0.85,
+                "f1": 0.62,
+                "recall": 0.45,
+                "net_retained_revenue": 1500.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = gate.evaluate_model_gate(
+        model_path,
+        require_model=True,
+        metrics_path=metrics_path,
+    )
+
+    assert result.passed is False
+    assert "recall" in result.message
+
+
+def test_gate_fails_when_net_retained_revenue_not_positive(tmp_path, sample_raw_df):
+    gate = _load_gate_module()
+    model_path = _save_dummy_pipeline(tmp_path, sample_raw_df)
+    metrics_path = tmp_path / "metrics.json"
+
+    for invalid_revenue in (0.0, -250.0):
+        metrics_path.write_text(
+            json.dumps(
+                {
+                    "roc_auc": 0.85,
+                    "f1": 0.62,
+                    "recall": 0.70,
+                    "net_retained_revenue": invalid_revenue,
+                }
+            ),
+            encoding="utf-8",
+        )
+
+        result = gate.evaluate_model_gate(
+            model_path,
+            require_model=True,
+            metrics_path=metrics_path,
+        )
+
+        assert result.passed is False
+        assert "net_retained_revenue" in result.message
+
+
+def test_gate_passes_with_default_thresholds_and_full_metrics(tmp_path, sample_raw_df):
+    gate = _load_gate_module()
+    model_path = _save_dummy_pipeline(tmp_path, sample_raw_df)
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "roc_auc": 0.84,
+                "f1": 0.61,
+                "recall": 0.72,
+                "net_retained_revenue": 12000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    result = gate.evaluate_model_gate(
+        model_path,
+        require_model=True,
+        metrics_path=metrics_path,
+    )
+
+    assert result.passed is True
+    assert result.skipped is False
+
+
+def test_gate_cli_accepts_min_recall_flag(tmp_path, sample_raw_df):
+    gate = _load_gate_module()
+    model_path = _save_dummy_pipeline(tmp_path, sample_raw_df)
+    metrics_path = tmp_path / "metrics.json"
+    metrics_path.write_text(
+        json.dumps(
+            {
+                "roc_auc": 0.84,
+                "f1": 0.61,
+                "recall": 0.70,
+                "net_retained_revenue": 5000.0,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    fail_code = gate.main(
+        [
+            "--model-path",
+            str(model_path),
+            "--metrics-path",
+            str(metrics_path),
+            "--require-model",
+            "--min-recall",
+            "0.80",
+        ]
+    )
+    pass_code = gate.main(
+        [
+            "--model-path",
+            str(model_path),
+            "--metrics-path",
+            str(metrics_path),
+            "--require-model",
+            "--min-recall",
+            "0.65",
+        ]
+    )
+
+    assert fail_code == 1
+    assert pass_code == 0
